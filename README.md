@@ -9,6 +9,9 @@
 - **Opera over MASQUE（套娃）** — 在 WARP 外面再叠一层 Opera VPN 落地，
   换个出口国家。见文末[套娃那条](#套娃opera-vpn-叠在-warp-上)。
 
+另外 `worker/` 目录是套娃那条的 Worker 版本，部署到 Cloudflare 上自己每 4 小时
+更新，带个状态页。见[跑在 Worker 上](#跑在-worker-上)。
+
 ## 怎么用
 
 **1. Fork 这个仓库**
@@ -244,3 +247,199 @@ Shadowrocket、Stash 不认 `dialer-proxy`，用不了套娃配置——
 
 `scripts/gen_opera_masque.py`。接入点清单和纯 WARP 那份是同一批
 （`V4` / `V6` / `PORTS`），`REGIONS` 控制取哪些 Opera 大区。
+
+---
+
+## 跑在 Worker 上
+
+Actions 那条要手动点一下才跑。如果想要它自己更新、随时有个 URL 能拿到最新配置，
+用 `worker/` 这份。
+
+Worker 每 4 小时自己重新拿一次 Opera 凭据、重建配置存进 KV。
+WARP 的注册信息也存 KV 里复用，不会每次都注册新设备。
+
+还有个状态页，能看到节点数、上次更新时间、下次更新时间，
+也能手动点刷新。
+
+### 部署方式一：网页（不用装任何东西）
+
+全程在 Cloudflare 后台点，适合不想碰命令行的情况。
+
+**1. 建 KV**
+
+Cloudflare 后台 → 左边 `存储和数据库` → `KV` → `创建实例`。
+名字随便填，比如 `opera-masque`。建好放着，等下要绑。
+
+> 找不到入口的话，`Workers 和 Pages` 里也能进 KV。菜单名各语言版本略有差异，
+> 认准 "KV" 这两个字母。
+
+**2. 建 Worker**
+
+左边 `Compute (Workers)` → `Workers 和 Pages` → `创建` → `从 Hello World! 开始` →
+起个名 → `部署`。
+
+先部署一个空壳，下一步再填代码。
+
+**3. 贴代码**
+
+进这个 Worker → 右上角 `编辑代码`。
+
+把 [`worker/dist/worker.js`](worker/dist/worker.js) 整个文件的内容复制过去，
+覆盖掉编辑器里原来的 `Hello World`。这是打包好的单文件，1100 多行，
+全选粘贴就行。
+
+粘完点右上角 `部署`。
+
+**4. 绑 KV**
+
+回到 Worker 页面 → `设置` → `绑定` → `添加` → 选 `KV 命名空间`。
+
+- 变量名填 **`KV`**（必须是这两个字母，大写）
+- KV 命名空间选第 1 步建的那个
+
+点 `部署`。
+
+**5. 设密码**
+
+还在 `设置` 页 → `变量和机密` → `添加` →
+
+- 类型选 **`机密 (Secret)`**
+- 变量名 **`PASSWORD`**
+- 值填你要设的密码
+
+点 `部署`。
+
+> 类型一定要选 `Secret` 不是 `文本`。选文本的话密码会在后台明文显示。
+
+**6. 改订阅路径（可选，但建议改）**
+
+同样在 `变量和机密` → `添加` →
+
+- 类型选 **`文本 (Text)`**
+- 变量名 **`SUB_PATH`**
+- 值填一串难猜的，比如 `a8f3d91c2b`
+
+不设的话默认是 `sub`。
+
+**7. 加定时更新**
+
+`设置` → `触发器` → `Cron 触发器` → `添加` → 选 `按计划` →
+表达式填：
+
+```
+0 */4 * * *
+```
+
+这就是每 4 小时跑一次。
+
+**8. 打开用**
+
+访问 `https://你的worker名.你的子域.workers.dev`，
+输第 5 步设的密码，进去就能看到订阅地址，复制走填进客户端。
+
+第一次打开订阅可能要等十几秒，它在现注册 WARP 和 Opera。
+
+---
+
+### 部署方式二：命令行
+
+```bash
+cd worker
+npm install
+npx wrangler login
+
+# 建 KV，把输出的 id 填进 wrangler.toml
+npx wrangler kv namespace create KV
+
+# 设密码。不设的话 Worker 会直接返回 500 拒绝服务，防止裸奔上线
+npx wrangler secret put PASSWORD
+
+npx wrangler deploy
+```
+
+部署完访问 `https://你的worker.workers.dev/`，输密码进去就能看到订阅地址。
+
+订阅路径在 `wrangler.toml` 里改：
+
+```toml
+[vars]
+SUB_PATH = "a8f3d91c2b"
+```
+
+改完重新 deploy，订阅地址就变成 `https://你的域名/a8f3d91c2b?token=...`。
+
+### 改了代码想重新打包
+
+网页部署用的 `dist/worker.js` 是从 `src/` 打包出来的，改完源码跑一下：
+
+```bash
+npm run build
+```
+
+### 访问控制怎么做的
+
+状态页和所有 API 都要密码。客户端拉订阅时带不了 cookie，所以订阅链接里
+挂了个签名 token——状态页上显示的那条完整链接直接复制走就行。
+
+- 密码只存在 Cloudflare 的 secret 里，不落配置文件
+- 会话是 HMAC 签名的 token，cookie 里没有密码本身
+- 密码比对走常数时间，不会从响应时间里泄露
+- 同一 IP 连续失败 8 次锁 15 分钟
+- 订阅路径不对或 token 无效，一律返回 404，不提示"密码错误"这类可枚举信息
+- 想让所有旧链接失效，改一次密码就够了（token 是用密码签的）
+
+### 路由
+
+| 路径 | 说明 |
+|---|---|
+| `/` | 状态页，要密码 |
+| `/login` | POST，登录 |
+| `/logout` | 退出 |
+| `SUB_PATH` | 订阅，要 `?token=` |
+| `/api/state` | JSON 状态，要登录 |
+| `/api/refresh` | POST，重新拿 Opera 凭据 |
+| `/api/reset-warp` | POST，重注册 WARP 设备 |
+
+订阅响应带了 `profile-update-interval: 4`，支持这个头的客户端会自己每 4 小时拉一次。
+
+### Worker 常见问题
+
+**打开显示"未设置 PASSWORD"** — 第 5 步没做，或者变量名拼错了。
+必须是全大写 `PASSWORD`。
+
+**报 KV 相关的错** — 第 4 步绑定的变量名不是 `KV`。必须是这两个字母大写。
+
+**订阅链接打开是 404** — token 过期了（7 天），回状态页重新复制一条。
+改过密码的话所有旧链接都会失效，这是故意的。
+
+**节点全都连不上** — 先点`刷新 Opera 凭据`。还不行再点`重注册 WARP 设备`。
+
+**导入客户端报错说不认识 masque** — 内核不是 mihomo Alpha。见下面那节。
+
+### 跑测试
+
+```bash
+cd worker && npm test
+```
+
+33 项，覆盖常数时间比较、token 伪造/篡改/过期、登录限速，
+以及路由层的鉴权（未登录一律 404、订阅 token 校验、cookie 安全属性）。
+
+### 两个坑
+
+**WebCrypto 导不出 mihomo 要的私钥格式。** WebCrypto 只能导 PKCS8，
+mihomo 要 SEC1，直接喂会报 `use ParsePKCS8PrivateKey instead`。
+而且光把 PKCS8 里那段抠出来还不够——WebCrypto 省略了曲线参数，
+会接着报 `unknown elliptic curve`。`warp.js` 里的 `pkcs8ToSec1`
+重新编了一份带 P-256 OID 的完整 SEC1。
+
+**Opera 的 API 用 Digest 认证，而 Digest 要 MD5。** WebCrypto 没有 MD5，
+所以 `md5.js` 是手写的。另外 Workers 的 fetch 不自动管 cookie，
+SurfEasy 的会话得手工存 `Set-Cookie`。
+
+### 跟 Actions 版的区别
+
+Worker 版少一道 `mihomo -t` 校验——Actions 里会真的下载 mihomo 加载一遍，
+确保推出去的配置能用，Worker 里做不到。
+
+换来的是自动更新和一个随时可用的 URL。
