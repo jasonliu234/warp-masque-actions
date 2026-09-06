@@ -71,6 +71,88 @@ button:disabled{opacity:.4;cursor:not-allowed}
 #msg{margin-top:10px;font-size:12px;min-height:18px}
 `;
 
+/** KV 没绑时的指引页。报错要能自己解决，别只丢个栈。 */
+export function renderNoKV() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OPERA // MASQUE</title>
+<style>${CSS}
+.wrap{width:100%;max-width:520px;position:relative;z-index:2;min-width:0;align-self:center}
+.step{font-size:12px;color:var(--dim);line-height:2;margin-top:6px}
+.step b{color:var(--cyan);font-weight:400}
+.step code{color:var(--yellow)}
+</style></head>
+<body><div class="wrap"><div class="term">
+  <div class="head">
+    <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+    <div class="title">KV Not Bound</div>
+  </div>
+  <div class="body">
+    <div class="step">
+      还没绑 KV，配置和密码都没地方存。<br><br>
+      <b>1.</b> Cloudflare 后台 → 存储和数据库 → KV → 创建实例<br>
+      <b>2.</b> 回到这个 Worker → 设置 → 绑定 → 添加 → KV 命名空间<br>
+      <b>3.</b> 变量名填 <code>KV</code>（两个字母，大写），命名空间选刚建的<br>
+      <b>4.</b> 部署，刷新本页
+    </div>
+  </div>
+</div></div></body></html>`;
+}
+
+/** 首次访问的初始化页，设管理密码。 */
+export function renderSetup() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OPERA // MASQUE</title>
+<style>${CSS}
+.wrap{width:100%;max-width:430px;position:relative;z-index:2;min-width:0;align-self:center}
+.f{display:flex;flex-direction:column;gap:10px}
+.hint{font-size:11px;color:var(--dim);line-height:1.9;margin-top:14px}
+.hint b{color:var(--yellow);font-weight:400}
+.lead{font-size:12px;color:var(--cyan);line-height:1.8;margin-bottom:16px}
+</style></head>
+<body><div class="wrap"><div class="term">
+  <div class="head">
+    <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+    <div class="title">First Run</div>
+  </div>
+  <div class="body">
+    <div class="lead">第一次打开，先设一个管理密码。<br>之后订阅路径、改密码都在界面里做。</div>
+    <form class="f" onsubmit="return go(event)">
+      <input type="password" id="p" placeholder="PASSWORD (>= 8)" autofocus autocomplete="new-password">
+      <input type="password" id="c" placeholder="CONFIRM" autocomplete="new-password">
+      <button type="submit">设置</button>
+    </form>
+    <div id="msg"></div>
+    <div class="hint">
+      密码只存哈希（PBKDF2 + 随机盐），KV 里看不到明文。<br>
+      <b>忘了只能删掉 KV 里的 auth:cred 重来</b>，没有找回。
+    </div>
+  </div>
+</div></div>
+<script>
+async function go(e){
+  e.preventDefault();
+  const b=document.querySelector('button'), m=document.getElementById('msg');
+  b.disabled=true; m.textContent='> 设置中…'; m.style.color='var(--yellow)';
+  try{
+    const r=await fetch('/api/setup',{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({password:document.getElementById('p').value,
+                           confirm:document.getElementById('c').value})});
+    const j=await r.json();
+    if(j.ok){m.textContent='> 完成';m.style.color='var(--mint)';location.reload();}
+    else{m.textContent='> '+j.error;m.style.color='var(--red)';b.disabled=false;}
+  }catch(err){m.textContent='> '+err.message;m.style.color='var(--red)';b.disabled=false;}
+  return false;
+}
+</script>
+</body></html>`;
+}
+
 /** 登录页。密码错时不提示"用户名错误"这类可枚举信息。 */
 export function renderLogin(err) {
   return `<!DOCTYPE html>
@@ -94,7 +176,7 @@ export function renderLogin(err) {
       <button type="submit">进入</button>
     </form>
     <div id="msg"></div>
-    <div class="hint">密码由部署者用 wrangler secret 设置。<br>连续失败 8 次会锁定 15 分钟。</div>
+    <div class="hint">连续失败 8 次会锁定 15 分钟。</div>
   </div>
 </div></div>
 <script>
@@ -115,13 +197,17 @@ async function go(e){
 </body></html>`;
 }
 
-export function renderUI(state, host, sp, token) {
+export function renderUI(state, host, sp, token, cred) {
   const s = state || {};
   const warp = s.warp || {};
   const stat = s.stats || {};
   const updated = s.updatedAt ? new Date(s.updatedAt) : null;
   const ago = updated ? Math.floor((Date.now() - updated.getTime()) / 60000) : null;
-  const next = updated ? new Date(updated.getTime() + 4 * 3600 * 1000) : null;
+  const exp = s.expiresAt ? new Date(s.expiresAt) : null;
+  const left = exp ? Math.floor((exp.getTime() - Date.now()) / 60000) : null;
+  const leftTxt = left === null ? "—"
+    : left <= 0 ? "已过期，下次访问订阅时自动重建"
+    : `${Math.floor(left / 60)} 小时 ${left % 60} 分后过期`;
   const fmt = (d) => d ? d.toISOString().replace("T", " ").slice(0, 19) + " UTC" : "—";
   const sub = `https://${host}${sp}?token=${token}`;
 
@@ -162,6 +248,9 @@ export function renderUI(state, host, sp, token) {
   overflow-wrap:anywhere}
 .sub{display:flex;gap:8px;align-items:stretch;margin-top:4px;flex-wrap:wrap}
 .sub input{flex:1;min-width:0}
+.pw{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;margin-top:4px}
+.pw input{min-width:0}
+@media(max-width:700px){.pw{grid-template-columns:1fr}}
 .note{font-size:11px;color:var(--dim);line-height:1.85;margin-top:12px;
   overflow-wrap:anywhere;word-break:break-word}
 .note b{color:var(--yellow);font-weight:400}
@@ -209,8 +298,14 @@ export function renderUI(state, host, sp, token) {
       <div class="sec-t">订阅</div>
       <div class="sub">
         <input id="u" value="${sub}" readonly>
-        <button onclick="cp()">复制</button>
+        <button onclick="cp('u')">复制</button>
         <button class="gh" onclick="location.href=document.getElementById('u').value">下载</button>
+      </div>
+      <div class="note">
+        一份聚合，导进去有两类线路可切：<br>
+        <b>亚洲/欧洲/美洲线路</b> — 走 MASQUE 再落 Opera，能换出口国家，但多一跳会慢些。<br>
+        <b>WARP直连</b> — 只走 MASQUE，出口是 Cloudflare 自己的 IP，快但选不了国家。<br>
+        套娃线路超时或落地挂了，切 WARP直连顶上。
       </div>
       <div id="msg"></div>
     </div>
@@ -221,6 +316,7 @@ export function renderUI(state, host, sp, token) {
         <div class="cell"><div class="n">${stat.combos ?? "—"}</div><div class="l">组合节点</div></div>
         <div class="cell"><div class="n">${stat.entries ?? "—"}</div><div class="l">MASQUE 接入点</div></div>
         <div class="cell"><div class="n">${stat.landings ?? "—"}</div><div class="l">Opera 落地</div></div>
+        <div class="cell"><div class="n">${stat.entries ?? "—"}</div><div class="l">WARP 直连</div></div>
       </div>
       <div class="note">
         每个落地和每个接入点都组合一遍，任一环失效都还有别的路走。<br>
@@ -232,9 +328,9 @@ export function renderUI(state, host, sp, token) {
       <div class="sec-t">状态</div>
       ${row("上次更新", updated ? `${fmt(updated)}（${ago} 分钟前）` : "尚未生成",
              updated ? (ago > 250 ? "warn" : "ok") : "err")}
-      ${row("下次自动更新", fmt(next))}
-      ${row("更新周期", "每 4 小时")}
-      ${row("订阅路径", sp)}
+      ${row("凭据剩余", leftTxt, left === null ? "" : left <= 0 ? "warn" : "ok")}
+      ${row("到期时间", fmt(exp))}
+      ${row("密码更新于", cred && cred.updatedAt ? fmt(new Date(cred.updatedAt)) : "—")}
       ${row("WARP 设备", warp.deviceId ? warp.deviceId.slice(0, 8) + "…" : "—")}
       ${row("WARP 注册于", warp.registeredAt ? fmt(new Date(warp.registeredAt)) : "—")}
       ${row("内网地址", warp.ipv4 || "—")}
@@ -247,8 +343,36 @@ export function renderUI(state, host, sp, token) {
         <button class="gh" onclick="go('/api/reset-warp')">重注册 WARP 设备</button>
       </div>
       <div class="note">
-        Opera 凭据是匿名注册的会过期，连不上就点刷新。<br>
+        Opera 凭据 4 小时到期。<b>不用定时任务</b>——订阅被访问时才检查，
+        没过期直接给缓存，过期了才重新注册。<br>
+        想提前换一份就点刷新。<br>
         WARP 设备信息存在 KV 里复用，<b>一般不用重注册</b>，除非 MASQUE 整体连不上。
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-t">订阅路径</div>
+      <div class="sub">
+        <input id="sp" value="${sp.replace(/^\//, "")}" spellcheck="false"
+               placeholder="字母数字和 - _">
+        <button onclick="setPath('sp')">保存</button>
+      </div>
+      <div class="note">
+        改成难猜的字符串，等于在密码之外多一层。改完上面的订阅链接要重新复制。
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-t">修改密码</div>
+      <div class="pw">
+        <input type="password" id="c0" placeholder="当前密码" autocomplete="current-password">
+        <input type="password" id="c1" placeholder="新密码（>= 8）" autocomplete="new-password">
+        <input type="password" id="c2" placeholder="确认新密码" autocomplete="new-password">
+        <button onclick="setPw()">修改</button>
+      </div>
+      <div class="note">
+        改完<b>所有旧订阅链接立刻失效</b>，因为 token 是用密码哈希签的。
+        链接泄露了就靠这个补救。
       </div>
     </div>
 
@@ -257,7 +381,7 @@ export function renderUI(state, host, sp, token) {
       <div class="note">
         必须用 <b>mihomo Alpha</b> 内核，masque 出站和 dialer-proxy 稳定版都不支持。<br>
         可用客户端：Clash Verge Rev（内核切 Alpha）、ClashMi、FlClash。<br>
-        Shadowrocket、Stash 不认 dialer-proxy。<br>
+        Shadowrocket、Stash 不认 dialer-proxy，导进去只有 WARP直连 那组能用。<br>
         订阅链接里的 token 就是访问凭证，<b>别外传</b>，泄露了改密码即可全部失效。<br>
         配置里的 private-key 等同 WARP 账号凭据。<br>
         免费代理的流量对提供方可见，别走支付和敏感数据。
@@ -272,8 +396,8 @@ export function renderUI(state, host, sp, token) {
   </div>
 </div>
 <script>
-function cp(){
-  const el=document.getElementById('u');
+function cp(id){
+  const el=document.getElementById(id||'u');
   navigator.clipboard.writeText(el.value).then(
     ()=>say('已复制到剪贴板','var(--mint)'),
     ()=>{el.select();document.execCommand('copy');say('已复制','var(--mint)')});
@@ -282,6 +406,32 @@ function say(t,c){
   const m=document.getElementById('msg');
   m.textContent='> '+t; m.style.color=c;
   setTimeout(()=>{m.textContent=''},4000);
+}
+async function post(url,body,okmsg){
+  const bs=document.querySelectorAll('button');
+  bs.forEach(b=>b.disabled=true);
+  say('执行中…','var(--yellow)');
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},
+                            body:JSON.stringify(body)});
+    const j=await r.json();
+    if(j.ok){say((j.msg||okmsg)+'，即将刷新','var(--mint)');setTimeout(()=>location.reload(),1400);}
+    else{say('失败: '+j.error,'var(--red)');bs.forEach(b=>b.disabled=false);}
+  }catch(e){say('失败: '+e.message,'var(--red)');bs.forEach(b=>b.disabled=false);}
+}
+function setPath(id){
+  const v=document.getElementById(id||'sp').value.trim();
+  if(!v){say('路径不能为空','var(--red)');return;}
+  post('/api/sub-path',{path:v},'已保存');
+}
+function setPw(){
+  const c0=document.getElementById('c0').value;
+  const c1=document.getElementById('c1').value;
+  const c2=document.getElementById('c2').value;
+  if(!c0||!c1){say('把三个框都填了','var(--red)');return;}
+  if(c1!==c2){say('两次输入不一致','var(--red)');return;}
+  if(c1.length<8){say('新密码至少 8 位','var(--red)');return;}
+  post('/api/password',{current:c0,password:c1,confirm:c2},'已修改');
 }
 async function go(p){
   const bs=document.querySelectorAll('button');

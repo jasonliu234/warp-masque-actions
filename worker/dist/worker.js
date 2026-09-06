@@ -81,14 +81,14 @@ function pkcs8ToSec1(b64pkcs8) {
   const tlv = (pos) => {
     const tag2 = der[pos];
     let len2 = der[pos + 1];
-    let p = pos + 2;
+    let p2 = pos + 2;
     if (len2 & 128) {
       const n = len2 & 127;
       len2 = 0;
-      for (let k = 0; k < n; k++) len2 = len2 << 8 | der[p + k];
-      p += n;
+      for (let k = 0; k < n; k++) len2 = len2 << 8 | der[p2 + k];
+      p2 += n;
     }
-    return [tag2, p, len2, p + len2];
+    return [tag2, p2, len2, p2 + len2];
   };
   let i = tlv(0)[1];
   i = tlv(i)[3];
@@ -122,14 +122,14 @@ function pkcs8ToSec1(b64pkcs8) {
 function tlv2(buf, pos) {
   const tag = buf[pos];
   let len = buf[pos + 1];
-  let p = pos + 2;
+  let p2 = pos + 2;
   if (len & 128) {
     const n = len & 127;
     len = 0;
-    for (let k = 0; k < n; k++) len = len << 8 | buf[p + k];
-    p += n;
+    for (let k = 0; k < n; k++) len = len << 8 | buf[p2 + k];
+    p2 += n;
   }
-  return [tag, p, len, p + len];
+  return [tag, p2, len, p2 + len];
 }
 function derLen(n) {
   if (n < 128) return [n];
@@ -271,6 +271,12 @@ var H2 = {
   "Accept": "application/json"
 };
 var REGIONS = { AS: "\u4E9A\u6D32", EU: "\u6B27\u6D32", AM: "\u7F8E\u6D32" };
+async function digestHash(algo, s) {
+  if (/^md5$/i.test(algo)) return md5Hex(s);
+  const name = /512/.test(algo) ? "SHA-512" : "SHA-256";
+  const d = await crypto.subtle.digest(name, new TextEncoder().encode(s));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 async function sha1Upper(s) {
   const d = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
@@ -297,14 +303,15 @@ var Session = class {
       const wa = r.headers.get("www-authenticate") || "";
       const g = (k) => (wa.match(new RegExp(`${k}="([^"]*)"`)) || [])[1] || "";
       const realm = g("realm"), nonce = g("nonce"), qop = g("qop"), opaque = g("opaque");
+      const algo = g("algorithm") || (wa.match(/algorithm=([\w-]+)/) || [])[1] || "MD5";
       const uri = new URL(url).pathname;
       const cnonce = randHex2(8), nc = "00000001";
-      const ha1 = md5Hex(`${API_USER}:${realm}:${API_PASS}`);
-      const ha2 = md5Hex(`POST:${uri}`);
-      const q = qop ? qop.split(",")[0].trim() : "";
-      const resp = q ? md5Hex(`${ha1}:${nonce}:${nc}:${cnonce}:${q}:${ha2}`) : md5Hex(`${ha1}:${nonce}:${ha2}`);
-      let a = `Digest username="${API_USER}", realm="${realm}", nonce="${nonce}", uri="${uri}", response="${resp}"`;
-      if (q) a += `, qop=${q}, nc=${nc}, cnonce="${cnonce}"`;
+      const H1 = await digestHash(algo, `${API_USER}:${realm}:${API_PASS}`);
+      const H22 = await digestHash(algo, `POST:${uri}`);
+      const q2 = qop ? qop.split(",")[0].trim() : "";
+      const resp = q2 ? await digestHash(algo, `${H1}:${nonce}:${nc}:${cnonce}:${q2}:${H22}`) : await digestHash(algo, `${H1}:${nonce}:${H22}`);
+      let a = `Digest username="${API_USER}", realm="${realm}", nonce="${nonce}", uri="${uri}", response="${resp}", algorithm=${algo}`;
+      if (q2) a += `, qop=${q2}, nc=${nc}, cnonce="${cnonce}"`;
       if (opaque) a += `, opaque="${opaque}"`;
       this._absorb(r);
       r = await fetch(url, {
@@ -422,10 +429,9 @@ function masqueNode(name, ip, port, priv, pub, v4, v6, sni) {
     remote-dns-resolve: true
     dns: [1.1.1.1, 2606:4700:4700::1111]`;
 }
-function buildConfig(warp, opera) {
+function buildEntries(warp) {
   const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6 } = warp;
-  const entries = [];
-  const proxies = [];
+  const entries = [], proxies = [];
   for (const ip of [...V4, ...V6]) {
     for (const port of PORTS) {
       const n = entryName(ip, port);
@@ -444,28 +450,11 @@ function buildConfig(warp, opera) {
     v6,
     OFFICIAL_SNI
   ));
-  const byLoc = {};
-  for (const land of opera.landings) {
-    for (const ent of entries) {
-      const name = `${land.tag}@${ent}`;
-      (byLoc[land.loc] ||= []).push(name);
-      proxies.push(
-        `  - {name: "${name}", type: http, server: ${land.ip}, port: ${land.port}, username: ${opera.username}, password: ${opera.password}, tls: true, sni: ${land.host}, skip-cert-verify: false, dialer-proxy: ${ent}}`
-      );
-    }
-  }
-  const combos = Object.values(byLoc).reduce((a, b) => a + b.length, 0);
-  const q = (a, n = 6) => a.map((x) => " ".repeat(n) + `- "${x}"`).join("\n");
-  const p = (a, n = 6) => a.map((x) => " ".repeat(n) + `- ${x}`).join("\n");
-  const locNames = Object.keys(byLoc).map((l) => `${l}\u7EBF\u8DEF`);
-  const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}\u7EBF\u8DEF
-    type: url-test
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 80
-    lazy: true
-    proxies:
-${q(tags)}`).join("\n\n");
+  return { entries, proxies };
+}
+var q = (a, n = 6) => a.map((x) => " ".repeat(n) + `- "${x}"`).join("\n");
+var p = (a, n = 6) => a.map((x) => " ".repeat(n) + `- ${x}`).join("\n");
+function buildRules() {
   const prov = [], rules = [];
   RULESETS.forEach(([group, url], i) => {
     const pn = `rule${String(i).padStart(2, "0")}`;
@@ -478,23 +467,14 @@ ${q(tags)}`).join("\n\n");
     path: ./ruleset/${pn}.list`);
     rules.push(`  - RULE-SET,${pn},${group}`);
   });
-  const yaml = `# Opera VPN over Cloudflare WARP (MASQUE)
-# \u7531 Cloudflare Worker \u81EA\u52A8\u751F\u6210\u4E8E ${(/* @__PURE__ */ new Date()).toISOString()}
-#
-# \u94FE\u8DEF: \u672C\u673A -> MASQUE \u63A5\u5165\u70B9 -> Opera \u843D\u5730 -> \u76EE\u6807
-# \u8282\u70B9\u540D "\u6B27\u6D321@198.1-443" = \u6B27\u6D32\u7B2C 1 \u4E2A\u843D\u5730\uFF0C\u7ECF 162.159.198.1:443 \u63A5\u5165\u3002
-#
-# \u63A5\u5165\u70B9 ${entries.length} \u4E2A x \u843D\u5730 ${opera.landings.length} \u4E2A = \u7EC4\u5408 ${combos} \u4E2A\u3002
-# \u4EFB\u4E00\u63A5\u5165\u70B9\u88AB\u5899\u6216\u4EFB\u4E00\u843D\u5730\u5931\u6548\uFF0C\u5176\u4ED6\u7EC4\u5408\u4ECD\u53EF\u7528\u3002
-#
-# \u9700\u8981 mihomo Alpha \u5206\u652F\uFF1A\u7A33\u5B9A\u7248\u6CA1\u6709 masque outbound\u3002
-# private-key \u7B49\u540C WARP \u8D26\u53F7\u51ED\u636E\uFF0C\u522B\u5916\u4F20\u3002
-
-mixed-port: 7890
+  return { prov: prov.join("\n"), rules: rules.join("\n") };
+}
+function head(ipv6) {
+  return `mixed-port: 7890
 allow-lan: false
 mode: rule
 log-level: info
-ipv6: true
+ipv6: ${ipv6}
 unified-delay: true
 tcp-concurrent: true
 find-process-mode: 'off'
@@ -521,7 +501,7 @@ sniffer:
 dns:
   enable: true
   listen: 0.0.0.0:1053
-  ipv6: true
+  ipv6: ${ipv6}
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
@@ -543,45 +523,16 @@ dns:
       - https://1.12.12.12/dns-query
     'geosite:geolocation-!cn':
       - https://1.1.1.1/dns-query
-      - https://8.8.8.8/dns-query
-
-proxies:
-${proxies.join("\n")}
-
-proxy-groups:
-  - name: \u{1F680} \u8282\u70B9\u9009\u62E9
-    type: select
-    proxies:
-      - \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
-${p(locNames)}
-      - \u{1F504} \u6545\u969C\u8F6C\u79FB
-
-  - name: \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
-    type: url-test
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
-    lazy: true
-    proxies:
-${p(locNames)}
-
-  - name: \u{1F504} \u6545\u969C\u8F6C\u79FB
-    type: fallback
-    url: http://www.gstatic.com/generate_204
-    interval: 180
-    lazy: true
-    proxies:
-${p(locNames)}
-
-${locDefs}
-
-  - name: \u{1F4F9} \u6CB9\u7BA1\u89C6\u9891
+      - https://8.8.8.8/dns-query`;
+}
+function tailGroups(picks) {
+  return `  - name: \u{1F4F9} \u6CB9\u7BA1\u89C6\u9891
     type: select
     proxies:
       - \u{1F680} \u8282\u70B9\u9009\u62E9
       - \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
       - \u{1F504} \u6545\u969C\u8F6C\u79FB
-${p(locNames)}
+${p(picks)}
 
   - name: \u{1F3A5} \u5948\u98DE\u89C6\u9891
     type: select
@@ -589,7 +540,7 @@ ${p(locNames)}
       - \u{1F680} \u8282\u70B9\u9009\u62E9
       - \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
       - \u{1F504} \u6545\u969C\u8F6C\u79FB
-${p(locNames)}
+${p(picks)}
 
   - name: \u{1F30D} \u56FD\u5916\u5A92\u4F53
     type: select
@@ -612,7 +563,7 @@ ${p(locNames)}
       - \u{1F680} \u8282\u70B9\u9009\u62E9
       - \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
       - \u{1F504} \u6545\u969C\u8F6C\u79FB
-${p(locNames)}
+${p(picks)}
 
   - name: \u24C2\uFE0F \u5FAE\u8F6F\u670D\u52A1
     type: select
@@ -659,13 +610,96 @@ ${p(locNames)}
     proxies:
       - \u{1F680} \u8282\u70B9\u9009\u62E9
       - \u{1F3AF} \u5168\u7403\u76F4\u8FDE
+      - \u267B\uFE0F \u81EA\u52A8\u9009\u62E9`;
+}
+function buildConfig(warp, opera) {
+  const { entries, proxies } = buildEntries(warp);
+  const byLoc = {};
+  for (const land of opera.landings) {
+    for (const ent of entries) {
+      const name = `${land.tag}@${ent}`;
+      (byLoc[land.loc] ||= []).push(name);
+      proxies.push(
+        `  - {name: "${name}", type: http, server: ${land.ip}, port: ${land.port}, username: ${opera.username}, password: ${opera.password}, tls: true, sni: ${land.host}, skip-cert-verify: false, dialer-proxy: ${ent}}`
+      );
+    }
+  }
+  const combos = Object.values(byLoc).reduce((a, b) => a + b.length, 0);
+  const locNames = Object.keys(byLoc).map((l) => `${l}\u7EBF\u8DEF`);
+  const picks = [...locNames, "WARP\u76F4\u8FDE"];
+  const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}\u7EBF\u8DEF
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 80
+    lazy: true
+    proxies:
+${q(tags)}`).join("\n\n");
+  const { prov, rules } = buildRules();
+  const yaml = `# Opera VPN over Cloudflare WARP (MASQUE)
+# \u7531 Cloudflare Worker \u751F\u6210\u4E8E ${(/* @__PURE__ */ new Date()).toISOString()}
+#
+# \u805A\u5408\u7248\uFF1A\u5957\u5A03\u7EBF\u8DEF\u548C WARP \u76F4\u8FDE\u90FD\u5728\u8FD9\u4E00\u4EFD\u91CC\u3002
+#
+#   \u4E9A\u6D32/\u6B27\u6D32/\u7F8E\u6D32\u7EBF\u8DEF  \u672C\u673A -> MASQUE -> Opera \u843D\u5730 -> \u76EE\u6807\uFF08\u80FD\u6362\u51FA\u53E3\u56FD\u5BB6\uFF09
+#   WARP\u76F4\u8FDE            \u672C\u673A -> MASQUE -> \u76EE\u6807\uFF08\u51FA\u53E3\u662F CF \u81EA\u5DF1\u7684 IP\uFF0C\u5FEB\uFF09
+#
+# \u8282\u70B9\u540D "\u6B27\u6D321@198.1-443" = \u6B27\u6D32\u7B2C 1 \u4E2A\u843D\u5730\uFF0C\u7ECF 162.159.198.1:443 \u63A5\u5165\u3002
+#
+# \u63A5\u5165\u70B9 ${entries.length} \u4E2A x \u843D\u5730 ${opera.landings.length} \u4E2A = \u7EC4\u5408 ${combos} \u4E2A\uFF0C
+# \u5916\u52A0 ${entries.length} \u4E2A\u76F4\u8FDE\u63A5\u5165\u70B9\u3002\u4EFB\u4E00\u73AF\u5931\u6548\u90FD\u6709\u66FF\u4EE3\u8DEF\u5F84\u3002
+#
+# \u9700\u8981 mihomo Alpha \u5206\u652F\uFF1A\u7A33\u5B9A\u7248\u6CA1\u6709 masque outbound\uFF0C\u4E5F\u4E0D\u8BA4 dialer-proxy\u3002
+# private-key \u7B49\u540C WARP \u8D26\u53F7\u51ED\u636E\uFF0C\u522B\u5916\u4F20\u3002
+
+${head(true)}
+
+proxies:
+${proxies.join("\n")}
+
+proxy-groups:
+  - name: \u{1F680} \u8282\u70B9\u9009\u62E9
+    type: select
+    proxies:
       - \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
+${p(picks)}
+      - \u{1F504} \u6545\u969C\u8F6C\u79FB
+
+  - name: \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    lazy: true
+    proxies:
+${p(picks)}
+
+  - name: \u{1F504} \u6545\u969C\u8F6C\u79FB
+    type: fallback
+    url: http://www.gstatic.com/generate_204
+    interval: 180
+    lazy: true
+    proxies:
+${p(picks)}
+
+${locDefs}
+
+  - name: WARP\u76F4\u8FDE
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    lazy: true
+    proxies:
+${q(entries)}
+
+${tailGroups(picks)}
 
 rule-providers:
-${prov.join("\n")}
+${prov}
 
 rules:
-${rules.join("\n")}
+${rules}
   - GEOIP,LAN,\u{1F3AF} \u5168\u7403\u76F4\u8FDE,no-resolve
   - GEOIP,CN,\u{1F3AF} \u5168\u7403\u76F4\u8FDE
   - MATCH,\u{1F41F} \u6F0F\u7F51\u4E4B\u9C7C
@@ -745,6 +779,84 @@ button.gh:hover{background:var(--cyan);color:#05030e;box-shadow:0 0 16px var(--c
 button:disabled{opacity:.4;cursor:not-allowed}
 #msg{margin-top:10px;font-size:12px;min-height:18px}
 `;
+function renderNoKV() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OPERA // MASQUE</title>
+<style>${CSS}
+.wrap{width:100%;max-width:520px;position:relative;z-index:2;min-width:0;align-self:center}
+.step{font-size:12px;color:var(--dim);line-height:2;margin-top:6px}
+.step b{color:var(--cyan);font-weight:400}
+.step code{color:var(--yellow)}
+</style></head>
+<body><div class="wrap"><div class="term">
+  <div class="head">
+    <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+    <div class="title">KV Not Bound</div>
+  </div>
+  <div class="body">
+    <div class="step">
+      \u8FD8\u6CA1\u7ED1 KV\uFF0C\u914D\u7F6E\u548C\u5BC6\u7801\u90FD\u6CA1\u5730\u65B9\u5B58\u3002<br><br>
+      <b>1.</b> Cloudflare \u540E\u53F0 \u2192 \u5B58\u50A8\u548C\u6570\u636E\u5E93 \u2192 KV \u2192 \u521B\u5EFA\u5B9E\u4F8B<br>
+      <b>2.</b> \u56DE\u5230\u8FD9\u4E2A Worker \u2192 \u8BBE\u7F6E \u2192 \u7ED1\u5B9A \u2192 \u6DFB\u52A0 \u2192 KV \u547D\u540D\u7A7A\u95F4<br>
+      <b>3.</b> \u53D8\u91CF\u540D\u586B <code>KV</code>\uFF08\u4E24\u4E2A\u5B57\u6BCD\uFF0C\u5927\u5199\uFF09\uFF0C\u547D\u540D\u7A7A\u95F4\u9009\u521A\u5EFA\u7684<br>
+      <b>4.</b> \u90E8\u7F72\uFF0C\u5237\u65B0\u672C\u9875
+    </div>
+  </div>
+</div></div></body></html>`;
+}
+function renderSetup() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OPERA // MASQUE</title>
+<style>${CSS}
+.wrap{width:100%;max-width:430px;position:relative;z-index:2;min-width:0;align-self:center}
+.f{display:flex;flex-direction:column;gap:10px}
+.hint{font-size:11px;color:var(--dim);line-height:1.9;margin-top:14px}
+.hint b{color:var(--yellow);font-weight:400}
+.lead{font-size:12px;color:var(--cyan);line-height:1.8;margin-bottom:16px}
+</style></head>
+<body><div class="wrap"><div class="term">
+  <div class="head">
+    <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+    <div class="title">First Run</div>
+  </div>
+  <div class="body">
+    <div class="lead">\u7B2C\u4E00\u6B21\u6253\u5F00\uFF0C\u5148\u8BBE\u4E00\u4E2A\u7BA1\u7406\u5BC6\u7801\u3002<br>\u4E4B\u540E\u8BA2\u9605\u8DEF\u5F84\u3001\u6539\u5BC6\u7801\u90FD\u5728\u754C\u9762\u91CC\u505A\u3002</div>
+    <form class="f" onsubmit="return go(event)">
+      <input type="password" id="p" placeholder="PASSWORD (>= 8)" autofocus autocomplete="new-password">
+      <input type="password" id="c" placeholder="CONFIRM" autocomplete="new-password">
+      <button type="submit">\u8BBE\u7F6E</button>
+    </form>
+    <div id="msg"></div>
+    <div class="hint">
+      \u5BC6\u7801\u53EA\u5B58\u54C8\u5E0C\uFF08PBKDF2 + \u968F\u673A\u76D0\uFF09\uFF0CKV \u91CC\u770B\u4E0D\u5230\u660E\u6587\u3002<br>
+      <b>\u5FD8\u4E86\u53EA\u80FD\u5220\u6389 KV \u91CC\u7684 auth:cred \u91CD\u6765</b>\uFF0C\u6CA1\u6709\u627E\u56DE\u3002
+    </div>
+  </div>
+</div></div>
+<script>
+async function go(e){
+  e.preventDefault();
+  const b=document.querySelector('button'), m=document.getElementById('msg');
+  b.disabled=true; m.textContent='> \u8BBE\u7F6E\u4E2D\u2026'; m.style.color='var(--yellow)';
+  try{
+    const r=await fetch('/api/setup',{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({password:document.getElementById('p').value,
+                           confirm:document.getElementById('c').value})});
+    const j=await r.json();
+    if(j.ok){m.textContent='> \u5B8C\u6210';m.style.color='var(--mint)';location.reload();}
+    else{m.textContent='> '+j.error;m.style.color='var(--red)';b.disabled=false;}
+  }catch(err){m.textContent='> '+err.message;m.style.color='var(--red)';b.disabled=false;}
+  return false;
+}
+<\/script>
+</body></html>`;
+}
 function renderLogin(err) {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head>
@@ -767,7 +879,7 @@ function renderLogin(err) {
       <button type="submit">\u8FDB\u5165</button>
     </form>
     <div id="msg"></div>
-    <div class="hint">\u5BC6\u7801\u7531\u90E8\u7F72\u8005\u7528 wrangler secret \u8BBE\u7F6E\u3002<br>\u8FDE\u7EED\u5931\u8D25 8 \u6B21\u4F1A\u9501\u5B9A 15 \u5206\u949F\u3002</div>
+    <div class="hint">\u8FDE\u7EED\u5931\u8D25 8 \u6B21\u4F1A\u9501\u5B9A 15 \u5206\u949F\u3002</div>
   </div>
 </div></div>
 <script>
@@ -787,13 +899,15 @@ async function go(e){
 <\/script>
 </body></html>`;
 }
-function renderUI(state, host, sp, token) {
+function renderUI(state, host, sp, token, cred) {
   const s = state || {};
   const warp = s.warp || {};
   const stat = s.stats || {};
   const updated = s.updatedAt ? new Date(s.updatedAt) : null;
   const ago = updated ? Math.floor((Date.now() - updated.getTime()) / 6e4) : null;
-  const next = updated ? new Date(updated.getTime() + 4 * 3600 * 1e3) : null;
+  const exp = s.expiresAt ? new Date(s.expiresAt) : null;
+  const left = exp ? Math.floor((exp.getTime() - Date.now()) / 6e4) : null;
+  const leftTxt = left === null ? "\u2014" : left <= 0 ? "\u5DF2\u8FC7\u671F\uFF0C\u4E0B\u6B21\u8BBF\u95EE\u8BA2\u9605\u65F6\u81EA\u52A8\u91CD\u5EFA" : `${Math.floor(left / 60)} \u5C0F\u65F6 ${left % 60} \u5206\u540E\u8FC7\u671F`;
   const fmt = (d) => d ? d.toISOString().replace("T", " ").slice(0, 19) + " UTC" : "\u2014";
   const sub = `https://${host}${sp}?token=${token}`;
   const row = (k, v, cls = "") => `<div class="row"><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
@@ -831,6 +945,9 @@ function renderUI(state, host, sp, token) {
   overflow-wrap:anywhere}
 .sub{display:flex;gap:8px;align-items:stretch;margin-top:4px;flex-wrap:wrap}
 .sub input{flex:1;min-width:0}
+.pw{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;margin-top:4px}
+.pw input{min-width:0}
+@media(max-width:700px){.pw{grid-template-columns:1fr}}
 .note{font-size:11px;color:var(--dim);line-height:1.85;margin-top:12px;
   overflow-wrap:anywhere;word-break:break-word}
 .note b{color:var(--yellow);font-weight:400}
@@ -878,8 +995,14 @@ function renderUI(state, host, sp, token) {
       <div class="sec-t">\u8BA2\u9605</div>
       <div class="sub">
         <input id="u" value="${sub}" readonly>
-        <button onclick="cp()">\u590D\u5236</button>
+        <button onclick="cp('u')">\u590D\u5236</button>
         <button class="gh" onclick="location.href=document.getElementById('u').value">\u4E0B\u8F7D</button>
+      </div>
+      <div class="note">
+        \u4E00\u4EFD\u805A\u5408\uFF0C\u5BFC\u8FDB\u53BB\u6709\u4E24\u7C7B\u7EBF\u8DEF\u53EF\u5207\uFF1A<br>
+        <b>\u4E9A\u6D32/\u6B27\u6D32/\u7F8E\u6D32\u7EBF\u8DEF</b> \u2014 \u8D70 MASQUE \u518D\u843D Opera\uFF0C\u80FD\u6362\u51FA\u53E3\u56FD\u5BB6\uFF0C\u4F46\u591A\u4E00\u8DF3\u4F1A\u6162\u4E9B\u3002<br>
+        <b>WARP\u76F4\u8FDE</b> \u2014 \u53EA\u8D70 MASQUE\uFF0C\u51FA\u53E3\u662F Cloudflare \u81EA\u5DF1\u7684 IP\uFF0C\u5FEB\u4F46\u9009\u4E0D\u4E86\u56FD\u5BB6\u3002<br>
+        \u5957\u5A03\u7EBF\u8DEF\u8D85\u65F6\u6216\u843D\u5730\u6302\u4E86\uFF0C\u5207 WARP\u76F4\u8FDE\u9876\u4E0A\u3002
       </div>
       <div id="msg"></div>
     </div>
@@ -890,6 +1013,7 @@ function renderUI(state, host, sp, token) {
         <div class="cell"><div class="n">${stat.combos ?? "\u2014"}</div><div class="l">\u7EC4\u5408\u8282\u70B9</div></div>
         <div class="cell"><div class="n">${stat.entries ?? "\u2014"}</div><div class="l">MASQUE \u63A5\u5165\u70B9</div></div>
         <div class="cell"><div class="n">${stat.landings ?? "\u2014"}</div><div class="l">Opera \u843D\u5730</div></div>
+        <div class="cell"><div class="n">${stat.entries ?? "\u2014"}</div><div class="l">WARP \u76F4\u8FDE</div></div>
       </div>
       <div class="note">
         \u6BCF\u4E2A\u843D\u5730\u548C\u6BCF\u4E2A\u63A5\u5165\u70B9\u90FD\u7EC4\u5408\u4E00\u904D\uFF0C\u4EFB\u4E00\u73AF\u5931\u6548\u90FD\u8FD8\u6709\u522B\u7684\u8DEF\u8D70\u3002<br>
@@ -904,9 +1028,9 @@ function renderUI(state, host, sp, token) {
     updated ? `${fmt(updated)}\uFF08${ago} \u5206\u949F\u524D\uFF09` : "\u5C1A\u672A\u751F\u6210",
     updated ? ago > 250 ? "warn" : "ok" : "err"
   )}
-      ${row("\u4E0B\u6B21\u81EA\u52A8\u66F4\u65B0", fmt(next))}
-      ${row("\u66F4\u65B0\u5468\u671F", "\u6BCF 4 \u5C0F\u65F6")}
-      ${row("\u8BA2\u9605\u8DEF\u5F84", sp)}
+      ${row("\u51ED\u636E\u5269\u4F59", leftTxt, left === null ? "" : left <= 0 ? "warn" : "ok")}
+      ${row("\u5230\u671F\u65F6\u95F4", fmt(exp))}
+      ${row("\u5BC6\u7801\u66F4\u65B0\u4E8E", cred && cred.updatedAt ? fmt(new Date(cred.updatedAt)) : "\u2014")}
       ${row("WARP \u8BBE\u5907", warp.deviceId ? warp.deviceId.slice(0, 8) + "\u2026" : "\u2014")}
       ${row("WARP \u6CE8\u518C\u4E8E", warp.registeredAt ? fmt(new Date(warp.registeredAt)) : "\u2014")}
       ${row("\u5185\u7F51\u5730\u5740", warp.ipv4 || "\u2014")}
@@ -919,8 +1043,36 @@ function renderUI(state, host, sp, token) {
         <button class="gh" onclick="go('/api/reset-warp')">\u91CD\u6CE8\u518C WARP \u8BBE\u5907</button>
       </div>
       <div class="note">
-        Opera \u51ED\u636E\u662F\u533F\u540D\u6CE8\u518C\u7684\u4F1A\u8FC7\u671F\uFF0C\u8FDE\u4E0D\u4E0A\u5C31\u70B9\u5237\u65B0\u3002<br>
+        Opera \u51ED\u636E 4 \u5C0F\u65F6\u5230\u671F\u3002<b>\u4E0D\u7528\u5B9A\u65F6\u4EFB\u52A1</b>\u2014\u2014\u8BA2\u9605\u88AB\u8BBF\u95EE\u65F6\u624D\u68C0\u67E5\uFF0C
+        \u6CA1\u8FC7\u671F\u76F4\u63A5\u7ED9\u7F13\u5B58\uFF0C\u8FC7\u671F\u4E86\u624D\u91CD\u65B0\u6CE8\u518C\u3002<br>
+        \u60F3\u63D0\u524D\u6362\u4E00\u4EFD\u5C31\u70B9\u5237\u65B0\u3002<br>
         WARP \u8BBE\u5907\u4FE1\u606F\u5B58\u5728 KV \u91CC\u590D\u7528\uFF0C<b>\u4E00\u822C\u4E0D\u7528\u91CD\u6CE8\u518C</b>\uFF0C\u9664\u975E MASQUE \u6574\u4F53\u8FDE\u4E0D\u4E0A\u3002
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-t">\u8BA2\u9605\u8DEF\u5F84</div>
+      <div class="sub">
+        <input id="sp" value="${sp.replace(/^\//, "")}" spellcheck="false"
+               placeholder="\u5B57\u6BCD\u6570\u5B57\u548C - _">
+        <button onclick="setPath('sp')">\u4FDD\u5B58</button>
+      </div>
+      <div class="note">
+        \u6539\u6210\u96BE\u731C\u7684\u5B57\u7B26\u4E32\uFF0C\u7B49\u4E8E\u5728\u5BC6\u7801\u4E4B\u5916\u591A\u4E00\u5C42\u3002\u6539\u5B8C\u4E0A\u9762\u7684\u8BA2\u9605\u94FE\u63A5\u8981\u91CD\u65B0\u590D\u5236\u3002
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-t">\u4FEE\u6539\u5BC6\u7801</div>
+      <div class="pw">
+        <input type="password" id="c0" placeholder="\u5F53\u524D\u5BC6\u7801" autocomplete="current-password">
+        <input type="password" id="c1" placeholder="\u65B0\u5BC6\u7801\uFF08>= 8\uFF09" autocomplete="new-password">
+        <input type="password" id="c2" placeholder="\u786E\u8BA4\u65B0\u5BC6\u7801" autocomplete="new-password">
+        <button onclick="setPw()">\u4FEE\u6539</button>
+      </div>
+      <div class="note">
+        \u6539\u5B8C<b>\u6240\u6709\u65E7\u8BA2\u9605\u94FE\u63A5\u7ACB\u523B\u5931\u6548</b>\uFF0C\u56E0\u4E3A token \u662F\u7528\u5BC6\u7801\u54C8\u5E0C\u7B7E\u7684\u3002
+        \u94FE\u63A5\u6CC4\u9732\u4E86\u5C31\u9760\u8FD9\u4E2A\u8865\u6551\u3002
       </div>
     </div>
 
@@ -929,7 +1081,7 @@ function renderUI(state, host, sp, token) {
       <div class="note">
         \u5FC5\u987B\u7528 <b>mihomo Alpha</b> \u5185\u6838\uFF0Cmasque \u51FA\u7AD9\u548C dialer-proxy \u7A33\u5B9A\u7248\u90FD\u4E0D\u652F\u6301\u3002<br>
         \u53EF\u7528\u5BA2\u6237\u7AEF\uFF1AClash Verge Rev\uFF08\u5185\u6838\u5207 Alpha\uFF09\u3001ClashMi\u3001FlClash\u3002<br>
-        Shadowrocket\u3001Stash \u4E0D\u8BA4 dialer-proxy\u3002<br>
+        Shadowrocket\u3001Stash \u4E0D\u8BA4 dialer-proxy\uFF0C\u5BFC\u8FDB\u53BB\u53EA\u6709 WARP\u76F4\u8FDE \u90A3\u7EC4\u80FD\u7528\u3002<br>
         \u8BA2\u9605\u94FE\u63A5\u91CC\u7684 token \u5C31\u662F\u8BBF\u95EE\u51ED\u8BC1\uFF0C<b>\u522B\u5916\u4F20</b>\uFF0C\u6CC4\u9732\u4E86\u6539\u5BC6\u7801\u5373\u53EF\u5168\u90E8\u5931\u6548\u3002<br>
         \u914D\u7F6E\u91CC\u7684 private-key \u7B49\u540C WARP \u8D26\u53F7\u51ED\u636E\u3002<br>
         \u514D\u8D39\u4EE3\u7406\u7684\u6D41\u91CF\u5BF9\u63D0\u4F9B\u65B9\u53EF\u89C1\uFF0C\u522B\u8D70\u652F\u4ED8\u548C\u654F\u611F\u6570\u636E\u3002
@@ -944,8 +1096,8 @@ function renderUI(state, host, sp, token) {
   </div>
 </div>
 <script>
-function cp(){
-  const el=document.getElementById('u');
+function cp(id){
+  const el=document.getElementById(id||'u');
   navigator.clipboard.writeText(el.value).then(
     ()=>say('\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F','var(--mint)'),
     ()=>{el.select();document.execCommand('copy');say('\u5DF2\u590D\u5236','var(--mint)')});
@@ -954,6 +1106,32 @@ function say(t,c){
   const m=document.getElementById('msg');
   m.textContent='> '+t; m.style.color=c;
   setTimeout(()=>{m.textContent=''},4000);
+}
+async function post(url,body,okmsg){
+  const bs=document.querySelectorAll('button');
+  bs.forEach(b=>b.disabled=true);
+  say('\u6267\u884C\u4E2D\u2026','var(--yellow)');
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},
+                            body:JSON.stringify(body)});
+    const j=await r.json();
+    if(j.ok){say((j.msg||okmsg)+'\uFF0C\u5373\u5C06\u5237\u65B0','var(--mint)');setTimeout(()=>location.reload(),1400);}
+    else{say('\u5931\u8D25: '+j.error,'var(--red)');bs.forEach(b=>b.disabled=false);}
+  }catch(e){say('\u5931\u8D25: '+e.message,'var(--red)');bs.forEach(b=>b.disabled=false);}
+}
+function setPath(id){
+  const v=document.getElementById(id||'sp').value.trim();
+  if(!v){say('\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A','var(--red)');return;}
+  post('/api/sub-path',{path:v},'\u5DF2\u4FDD\u5B58');
+}
+function setPw(){
+  const c0=document.getElementById('c0').value;
+  const c1=document.getElementById('c1').value;
+  const c2=document.getElementById('c2').value;
+  if(!c0||!c1){say('\u628A\u4E09\u4E2A\u6846\u90FD\u586B\u4E86','var(--red)');return;}
+  if(c1!==c2){say('\u4E24\u6B21\u8F93\u5165\u4E0D\u4E00\u81F4','var(--red)');return;}
+  if(c1.length<8){say('\u65B0\u5BC6\u7801\u81F3\u5C11 8 \u4F4D','var(--red)');return;}
+  post('/api/password',{current:c0,password:c1,confirm:c2},'\u5DF2\u4FEE\u6539');
 }
 async function go(p){
   const bs=document.querySelectorAll('button');
@@ -972,6 +1150,8 @@ async function go(p){
 
 // src/auth.js
 var enc = new TextEncoder();
+var ITER = 1e5;
+var b642 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
 function safeEqual(a, b) {
   const x = enc.encode(a || "");
   const y = enc.encode(b || "");
@@ -979,6 +1159,38 @@ function safeEqual(a, b) {
   let diff = x.length ^ y.length;
   for (let i = 0; i < n; i++) diff |= (x[i] || 0) ^ (y[i] || 0);
   return diff === 0;
+}
+async function pbkdf2(password, saltB64, iter = ITER) {
+  const salt = Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: iter, hash: "SHA-256" },
+    key,
+    256
+  );
+  return b642(bits);
+}
+async function makeCred(password) {
+  const s = new Uint8Array(16);
+  crypto.getRandomValues(s);
+  const salt = b642(s);
+  return {
+    salt,
+    iter: ITER,
+    hash: await pbkdf2(password, salt, ITER),
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+async function checkPassword(cred, password) {
+  if (!cred || !cred.hash) return false;
+  const h = await pbkdf2(password, cred.salt, cred.iter || ITER);
+  return safeEqual(h, cred.hash);
 }
 async function hmac(secret, msg) {
   const key = await crypto.subtle.importKey(
@@ -989,20 +1201,20 @@ async function hmac(secret, msg) {
     ["sign"]
   );
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
-  return btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return b642(sig).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 var TTL = 7 * 24 * 3600 * 1e3;
-async function signToken(secret) {
+async function signToken(cred) {
   const exp = Date.now() + TTL;
-  return `${exp}.${await hmac(secret, String(exp))}`;
+  return `${exp}.${await hmac(cred.hash, String(exp))}`;
 }
-async function verifyToken(secret, token) {
-  if (!token || !token.includes(".")) return false;
+async function verifyToken(cred, token) {
+  if (!cred || !cred.hash || !token || !token.includes(".")) return false;
   const i = token.lastIndexOf(".");
   const exp = token.slice(0, i);
   const sig = token.slice(i + 1);
   if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
-  return safeEqual(sig, await hmac(secret, exp));
+  return safeEqual(sig, await hmac(cred.hash, exp));
 }
 function readCookie(req, name) {
   const raw = req.headers.get("cookie") || "";
@@ -1022,19 +1234,42 @@ async function rateLimit(env, ip) {
 async function clearRateLimit(env, ip) {
   await env.KV.delete(`rl:${ip}`);
 }
+function normalizePath(p2) {
+  const clean = String(p2 || "").trim().replace(/^\/+|\/+$/g, "");
+  if (!clean) return null;
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(clean)) return null;
+  const reserved = ["login", "logout", "api", "setup"];
+  if (reserved.includes(clean.toLowerCase())) return null;
+  return clean;
+}
 
 // src/index.js
 var K_WARP = "warp:device";
 var K_CFG = "config:yaml";
 var K_STATE = "state:meta";
+var K_CRED = "auth:cred";
+var K_SET = "settings";
+var K_CLAIM = "auth:claim";
+var K_LOCK = "rebuild:lock";
 var COOKIE = "om_session";
+var DEFAULT_SUB = "sub";
+var TTL_MS = 4 * 3600 * 1e3;
+var SKEW_MS = 10 * 60 * 1e3;
 var json = (o, s = 200) => new Response(JSON.stringify(o), {
   status: s,
   headers: { "content-type": "application/json; charset=utf-8" }
 });
-function subPath(env) {
-  const p = (env.SUB_PATH || "sub").replace(/^\/+|\/+$/g, "");
-  return "/" + p;
+var html = (body, s = 200) => new Response(body, {
+  status: s,
+  headers: {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store"
+  }
+});
+var notFound = () => new Response("Not Found", { status: 404 });
+async function getSettings(env) {
+  const s = await env.KV.get(K_SET, "json") || {};
+  return { subPath: s.subPath || DEFAULT_SUB };
 }
 async function getWarp(env, force = false) {
   if (!force) {
@@ -1049,8 +1284,10 @@ async function rebuild(env, { forceWarp = false } = {}) {
   const warp = await getWarp(env, forceWarp);
   const opera = await fetchOpera();
   const { yaml, entries, landings, combos } = buildConfig(warp, opera);
+  const now = Date.now();
   const state = {
-    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    updatedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + TTL_MS).toISOString(),
     stats: { entries, landings, combos },
     warp: {
       deviceId: warp.deviceId,
@@ -1063,36 +1300,83 @@ async function rebuild(env, { forceWarp = false } = {}) {
   await env.KV.put(K_STATE, JSON.stringify(state));
   return state;
 }
-async function loggedIn(req, env) {
-  return verifyToken(env.PASSWORD, readCookie(req, COOKIE));
+function isFresh(state) {
+  if (!state || !state.expiresAt) return false;
+  return Date.parse(state.expiresAt) - SKEW_MS > Date.now();
+}
+async function ensureConfig(env) {
+  const state = await env.KV.get(K_STATE, "json");
+  const yaml = await env.KV.get(K_CFG);
+  if (yaml && isFresh(state)) return yaml;
+  const lock = await env.KV.get(K_LOCK);
+  if (lock && Date.now() - Number(lock) < 9e4) {
+    if (yaml) return yaml;
+  } else {
+    await env.KV.put(K_LOCK, String(Date.now()), { expirationTtl: 120 });
+    try {
+      await rebuild(env);
+    } finally {
+      await env.KV.delete(K_LOCK);
+    }
+  }
+  return await env.KV.get(K_CFG) || yaml;
 }
 var index_default = {
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(rebuild(env).catch((e) => console.error("\u5B9A\u65F6\u91CD\u5EFA\u5931\u8D25:", e.message)));
-  },
   async fetch(req, env) {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
     const ip = req.headers.get("cf-connecting-ip") || "unknown";
-    if (!env.PASSWORD) {
-      return new Response(
-        "\u672A\u8BBE\u7F6E PASSWORD\u3002\u8BF7\u6267\u884C: npx wrangler secret put PASSWORD",
-        { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } }
-      );
+    if (!env || !env.KV) return html(renderNoKV(), 500);
+    const cred = await env.KV.get(K_CRED, "json");
+    const authed = cred && await verifyToken(cred, readCookie(req, COOKIE));
+    if (!cred) {
+      if (path === "/api/setup" && req.method === "POST") {
+        const body = await req.json().catch(() => ({}));
+        const pw = String(body.password || "");
+        if (pw.length < 8) return json({ ok: false, error: "\u5BC6\u7801\u81F3\u5C11 8 \u4F4D" }, 400);
+        if (pw !== body.confirm) return json({ ok: false, error: "\u4E24\u6B21\u8F93\u5165\u4E0D\u4E00\u81F4" }, 400);
+        const claim = crypto.randomUUID();
+        if (await env.KV.get(K_CRED)) {
+          return json({ ok: false, error: "\u5BC6\u7801\u5DF2\u88AB\u8BBE\u7F6E\uFF0C\u8BF7\u5237\u65B0\u9875\u9762" }, 409);
+        }
+        await env.KV.put(K_CLAIM, claim, { expirationTtl: 60 });
+        if (await env.KV.get(K_CLAIM) !== claim) {
+          return json({ ok: false, error: "\u5BC6\u7801\u5DF2\u88AB\u8BBE\u7F6E\uFF0C\u8BF7\u5237\u65B0\u9875\u9762" }, 409);
+        }
+        const c = await makeCred(pw);
+        if (await env.KV.get(K_CRED)) {
+          return json({ ok: false, error: "\u5BC6\u7801\u5DF2\u88AB\u8BBE\u7F6E\uFF0C\u8BF7\u5237\u65B0\u9875\u9762" }, 409);
+        }
+        await env.KV.put(K_CRED, JSON.stringify(c));
+        await env.KV.delete(K_CLAIM);
+        const token = await signToken(c);
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "set-cookie": `${COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${7 * 24 * 3600}`
+          }
+        });
+      }
+      if (path === "/") return html(renderSetup());
+      return notFound();
     }
-    if (path === subPath(env)) {
+    const settings = await getSettings(env);
+    const subPath = "/" + settings.subPath;
+    if (path === subPath) {
       const t = url.searchParams.get("token") || "";
-      const ok = await verifyToken(env.PASSWORD, t) || await loggedIn(req, env);
-      if (!ok) return new Response("Not Found", { status: 404 });
-      let yaml = await env.KV.get(K_CFG);
+      if (!await verifyToken(cred, t) && !authed) return notFound();
+      const yaml = await ensureConfig(env);
       if (!yaml) {
-        await rebuild(env);
-        yaml = await env.KV.get(K_CFG);
+        return new Response(
+          "\u914D\u7F6E\u751F\u6210\u5931\u8D25\uFF0C\u7A0D\u540E\u91CD\u8BD5\u6216\u5230\u7BA1\u7406\u9875\u624B\u52A8\u5237\u65B0",
+          { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } }
+        );
       }
       return new Response(yaml, {
         headers: {
           "content-type": "text/yaml; charset=utf-8",
-          "content-disposition": 'attachment; filename="opera-masque.yaml"',
+          // 文件名不加引号：部分客户端不解析引号，会把 \"x\" 当成文件名的一部分
+          "content-disposition": "attachment; filename=opera-masque.yaml",
           "profile-update-interval": "4",
           "cache-control": "no-store"
         }
@@ -1103,11 +1387,11 @@ var index_default = {
         return json({ ok: false, error: "\u5C1D\u8BD5\u8FC7\u591A\uFF0C15 \u5206\u949F\u540E\u518D\u8BD5" }, 429);
       }
       const body = await req.json().catch(() => ({}));
-      if (!safeEqual(body.password || "", env.PASSWORD)) {
+      if (!await checkPassword(cred, String(body.password || ""))) {
         return json({ ok: false, error: "\u5BC6\u7801\u9519\u8BEF" }, 401);
       }
       await clearRateLimit(env, ip);
-      const token = await signToken(env.PASSWORD);
+      const token = await signToken(cred);
       return new Response(JSON.stringify({ ok: true }), {
         headers: {
           "content-type": "application/json; charset=utf-8",
@@ -1124,25 +1408,48 @@ var index_default = {
         }
       });
     }
-    const authed = await loggedIn(req, env);
     if (path === "/") {
-      if (!authed) {
-        return new Response(renderLogin(), {
-          headers: { "content-type": "text/html; charset=utf-8" }
-        });
-      }
+      if (!authed) return html(renderLogin());
       const state = await env.KV.get(K_STATE, "json");
-      const token = await signToken(env.PASSWORD);
-      return new Response(renderUI(state, url.host, subPath(env), token), {
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "no-store"
-        }
-      });
+      const token = await signToken(cred);
+      return html(renderUI(state, url.host, subPath, token, cred));
     }
-    if (!authed) return new Response("Not Found", { status: 404 });
+    if (!authed) return notFound();
     if (path === "/api/state") {
       return json(await env.KV.get(K_STATE, "json") || {});
+    }
+    if (path === "/api/sub-path" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const p2 = normalizePath(body.path);
+      if (!p2) {
+        return json({
+          ok: false,
+          error: "\u53EA\u80FD\u7528\u5B57\u6BCD\u6570\u5B57\u548C - _\uFF0C1-64 \u4F4D\uFF0C\u4E14\u4E0D\u80FD\u662F login/logout/api/setup"
+        }, 400);
+      }
+      await env.KV.put(K_SET, JSON.stringify({ ...settings, subPath: p2 }));
+      return json({ ok: true, msg: `\u8BA2\u9605\u8DEF\u5F84\u5DF2\u6539\u4E3A /${p2}` });
+    }
+    if (path === "/api/password" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      if (!await checkPassword(cred, String(body.current || ""))) {
+        return json({ ok: false, error: "\u5F53\u524D\u5BC6\u7801\u4E0D\u5BF9" }, 401);
+      }
+      const pw = String(body.password || "");
+      if (pw.length < 8) return json({ ok: false, error: "\u65B0\u5BC6\u7801\u81F3\u5C11 8 \u4F4D" }, 400);
+      if (pw !== body.confirm) return json({ ok: false, error: "\u4E24\u6B21\u8F93\u5165\u4E0D\u4E00\u81F4" }, 400);
+      const c = await makeCred(pw);
+      await env.KV.put(K_CRED, JSON.stringify(c));
+      const token = await signToken(c);
+      return new Response(
+        JSON.stringify({ ok: true, msg: "\u5BC6\u7801\u5DF2\u6539\uFF0C\u65E7\u7684\u8BA2\u9605\u94FE\u63A5\u5168\u90E8\u5931\u6548" }),
+        {
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "set-cookie": `${COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${7 * 24 * 3600}`
+          }
+        }
+      );
     }
     if (path === "/api/refresh" && req.method === "POST") {
       try {
@@ -1160,7 +1467,7 @@ var index_default = {
         return json({ ok: false, error: e.message }, 500);
       }
     }
-    return new Response("Not Found", { status: 404 });
+    return notFound();
   }
 };
 export {
